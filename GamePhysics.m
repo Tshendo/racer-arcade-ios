@@ -85,7 +85,7 @@ static void *probe_loop(void *arg) {
             mach_vm_address_t kobject = 0;
             if (mach_port_kobject(self, g_ports[i], &kotype, &kobject) != KERN_SUCCESS)
                 continue;
-            if (kotype != 2) continue;
+            if (kotype != 2 && kobject != DATA_TARGET) continue;
             task_ports++;
             ev("TASK_KOTYPE port=%d kotype=%u kobject=0x%016llx",
                i, kotype, (unsigned long long)kobject);
@@ -110,16 +110,14 @@ static void scan_background(void) {
         natural_t kotype = 0; mach_vm_address_t kobject = 0;
         kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i], &kotype, &kobject);
         if (kr != KERN_SUCCESS) continue;
+        if (kotype == (natural_t)0xFFFFFFFF && kobject == 0) continue;
 
         if (kobject == DATA_TARGET) {
-            if (kotype == 2) {
-                g_found = 1;
-                ev("HIT port=%d kotype=%u kobject=0x%016llx",
-                   i, kotype, (unsigned long long)kobject);
-            } else {
-                ev("HIT_WRONG_TYPE port=%d kotype=%u kobject=0x%016llx",
-                   i, kotype, (unsigned long long)kobject);
-            }
+            g_found = 1;
+            ev("HIT port=%d kotype=%u kobject=0x%016llx calling_task_info",
+               i, kotype, (unsigned long long)kobject);
+            struct task_basic_info inf; mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
+            task_info((task_t)g_ports[i], TASK_BASIC_INFO, (task_info_t)&inf, &cnt);
         } else if (kotype != 0 || kobject != 0) {
             ev("PORT_CHANGED port=%d kotype=%u kobject=0x%016llx",
                i, kotype, (unsigned long long)kobject);
